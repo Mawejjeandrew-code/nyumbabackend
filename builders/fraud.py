@@ -204,7 +204,7 @@ def calculate_fraud_score(
         re-implement the threshold logic.
         """
       weights = weights or DEFAULT_FRAUD_WEIGHTS
-      total_weight = sum(weights.value())
+      total_weight = sum(weights.values())
       norm = {k: v / total_weight for k, v in weights.items()}
 
       raw_signals = {

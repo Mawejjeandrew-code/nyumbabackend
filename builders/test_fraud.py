@@ -8,7 +8,7 @@
 from datetime import datetime, timezone, timedelta
 import pytest
 
-from app.fraud import (
+from builders.fraud import (
     score_price_drift,
     score_response_spike,
     score_edit_after_verification,
