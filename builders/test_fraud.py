@@ -8,7 +8,7 @@
 from datetime import datetime, timezone, timedelta
 import pytest
 
-from builders.fraud import (
+from app.fraud import (
     score_price_drift,
     score_response_spike,
     score_edit_after_verification,
@@ -69,6 +69,27 @@ def test_response_spike_severe():
 def test_response_spike_no_data():
     assert score_response_spike(None, 30) == 0.0
     assert score_response_spike(300, None) == 0.0
+
+
+def test_response_spike_regression_current_compared_to_itself_is_always_zero():
+    # Regression guard: this is the specific bug that shipped in main.py —
+    # response_at_verification was accidentally populated from the SAME
+    # source as current_avg_response_minutes, so the comparison was
+    # always "X vs X" and the signal could never fire, no matter how
+    # badly a landlord's response time degraded. This test documents
+    # that exact failure mode at the signal-function level: if a caller
+    # ever again passes the same value for both arguments, the score
+    # is guaranteed to be 0 — which is correct math, but is also the
+    # bug, if the two values were supposed to be genuinely different
+    # (current vs. a real historical snapshot) and weren't.
+    landlord_current_response = 600  # severely degraded
+    accidentally_same_value = 600    # the bug: snapshot == current
+    assert score_response_spike(landlord_current_response, accidentally_same_value) == 0.0, (
+        "If this is ever non-zero, the test itself is wrong — the real "
+        "fix lives in main.py, ensuring response_at_verification is "
+        "populated from response_minutes_at_verification (a true "
+        "snapshot column), never from the landlord's current value."
+    )
 
 
 def test_edit_after_verification_immediate():

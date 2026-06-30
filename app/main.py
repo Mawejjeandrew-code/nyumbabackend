@@ -684,7 +684,14 @@ def recompute_fraud_score(listing_id: str, trigger: str = "manual") -> dict:
         "price_at_verification": listing.get("price_at_verification"),
         "area_avg_price": area_avg,
         "current_avg_response_minutes": landlord.get("avg_response_minutes"),
-        "response_at_verification": landlord.get("avg_response_minutes"),  # baseline tracking improves over time
+        # Real snapshot of the landlord's response time taken at the
+        # moment THIS listing was verified — not the landlord's current
+        # value. Comparing current-vs-current always reads "no change",
+        # which silently disabled the response-spike signal entirely.
+        # Comes from fraud_risk_summary, which exposes the
+        # response_minutes_at_verification column set by the
+        # snapshot_on_verify() database trigger.
+        "response_at_verification": risk.get("response_minutes_at_verification"),
         "last_edited_at": parse_ts(listing.get("last_updated_at")),
         "verified_at": parse_ts(listing.get("verified_at_snapshot")),
         "total_reports": risk.get("total_reports", 0),
