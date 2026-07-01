@@ -1,20 +1,10 @@
-# ============================================
-# NYUMBA — RANKING SERVICE (FastAPI)
-# File: app/main.py
-# ============================================
-# Standalone Python service handling search ranking.
-# Your Next.js frontend calls this over HTTP instead
-# of running the algorithm in a Next.js API route.
-# ============================================
-# Run locally:
-#   uvicorn app.main:app --reload --port 8000
-# ============================================
+
 
 import os
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, Header
+from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -29,6 +19,8 @@ from logic.matching import build_sms_message, build_email_subject, build_email_b
 from builders.sms import send_match_sms
 from builders.email import send_match_email
 from builders.fraud import calculate_fraud_score, FRAUD_THRESHOLD_REVIEW, FRAUD_THRESHOLD_HIDE
+from app.auth import validate_signup_input, normalize_phone, phone_to_pseudo_email, is_valid_uganda_phone
+
 
 app = FastAPI(title="Nyumba Backend Service")
 
@@ -776,3 +768,266 @@ def get_fraud_queue(min_score: float = Query(FRAUD_THRESHOLD_REVIEW)):
         .execute()
     )
     return {"results": result.data or [], "count": len(result.data or [])}
+
+
+# ============================================
+# AUTH / PROFILES ENDPOINTS
+# ============================================
+# Phone+password login, implemented on top of Supabase Auth's
+# email/password system via a deterministic phone -> pseudo-email
+# mapping (see app/auth.py). The pseudo-email is an internal
+# implementation detail — landlords and tenants only ever see
+# and use their phone number.
+ 
+class LandlordSignupRequest(BaseModel):
+    phone: str
+    password: str
+    name: str
+    email: Optional[str] = None  # real email, optional — different from the pseudo-email
+ 
+ 
+@app.post("/auth/landlord/signup")
+def landlord_signup(payload: LandlordSignupRequest):
+    """
+    A landlord self-registers. Creates a Supabase Auth user under
+    the phone's pseudo-email, then creates the matching row in
+    the landlords table, linked via auth_user_id.
+    """
+    require_supabase()
+ 
+    validation = validate_signup_input(payload.phone, payload.password, payload.name)
+    if not validation["valid"]:
+        raise HTTPException(status_code=400, detail=validation["error"])
+ 
+    normalized_phone = validation["normalized_phone"]
+    pseudo_email = phone_to_pseudo_email(normalized_phone)
+ 
+    # Check for an existing landlord with this phone first — a clear
+    # 409 is a much better experience than a confusing Supabase
+    # Auth error surfacing from deep inside the sign-up call.
+    existing = (
+        supabase.table("landlords").select("id").eq("phone", normalized_phone).execute()
+    )
+    if existing.data:
+        raise HTTPException(status_code=409, detail="An account with this phone number already exists.")
+ 
+    try:
+        auth_result = supabase.auth.sign_up({
+            "email": pseudo_email,
+            "password": payload.password,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not create account: {e}")
+ 
+    if not auth_result.user:
+        raise HTTPException(status_code=500, detail="Account creation failed.")
+ 
+    landlord_result = supabase.table("landlords").insert({
+        "auth_user_id": auth_result.user.id,
+        "phone": normalized_phone,
+        "name": payload.name,
+        "email": payload.email,
+        "created_via": "self_signup",
+    }).execute()
+ 
+    if not landlord_result.data:
+        raise HTTPException(status_code=500, detail="Account created but profile setup failed. Contact support.")
+ 
+    return {
+        "success": True,
+        "landlord": landlord_result.data[0],
+        "session": {
+            "access_token": auth_result.session.access_token if auth_result.session else None,
+            "refresh_token": auth_result.session.refresh_token if auth_result.session else None,
+        },
+    }
+ 
+ 
+class LoginRequest(BaseModel):
+    phone: str
+    password: str
+ 
+ 
+@app.post("/auth/landlord/login")
+def landlord_login(payload: LoginRequest):
+    """
+    A landlord logs in with phone + password. Reconstructs the
+    same deterministic pseudo-email from the phone number and
+    authenticates against Supabase Auth.
+    """
+    require_supabase()
+ 
+    try:
+        normalized_phone = normalize_phone(payload.phone)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+ 
+    pseudo_email = phone_to_pseudo_email(normalized_phone)
+ 
+    try:
+        auth_result = supabase.auth.sign_in_with_password({
+            "email": pseudo_email,
+            "password": payload.password,
+        })
+    except Exception:
+        # Deliberately vague — never reveal whether the phone exists
+        # but the password was wrong vs. the phone doesn't exist at
+        # all. That distinction is exactly what lets an attacker
+        # enumerate which phone numbers have accounts.
+        raise HTTPException(status_code=401, detail="Incorrect phone number or password.")
+ 
+    landlord_result = (
+        supabase.table("landlords").select("*").eq("auth_user_id", auth_result.user.id).single().execute()
+    )
+ 
+    return {
+        "success": True,
+        "landlord": landlord_result.data,
+        "session": {
+            "access_token": auth_result.session.access_token,
+            "refresh_token": auth_result.session.refresh_token,
+        },
+    }
+ 
+ 
+class TenantSignupRequest(BaseModel):
+    phone: str
+    password: str
+    name: str
+    email: Optional[str] = None
+ 
+ 
+@app.post("/auth/tenant/signup")
+def tenant_signup(payload: TenantSignupRequest):
+    """
+    A tenant self-registers, same pattern as landlord signup.
+    Having a real tenant identity (rather than just a phone number
+    on each saved search) means a tenant's saved searches, their
+    report history, and their notification history all link to
+    ONE identity going forward.
+    """
+    require_supabase()
+ 
+    validation = validate_signup_input(payload.phone, payload.password, payload.name)
+    if not validation["valid"]:
+        raise HTTPException(status_code=400, detail=validation["error"])
+ 
+    normalized_phone = validation["normalized_phone"]
+    pseudo_email = phone_to_pseudo_email(normalized_phone)
+ 
+    existing = supabase.table("tenants").select("id").eq("phone", normalized_phone).execute()
+    if existing.data:
+        raise HTTPException(status_code=409, detail="An account with this phone number already exists.")
+ 
+    try:
+        auth_result = supabase.auth.sign_up({
+            "email": pseudo_email,
+            "password": payload.password,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not create account: {e}")
+ 
+    if not auth_result.user:
+        raise HTTPException(status_code=500, detail="Account creation failed.")
+ 
+    tenant_result = supabase.table("tenants").insert({
+        "auth_user_id": auth_result.user.id,
+        "phone": normalized_phone,
+        "name": payload.name,
+        "email": payload.email,
+    }).execute()
+ 
+    if not tenant_result.data:
+        raise HTTPException(status_code=500, detail="Account created but profile setup failed. Contact support.")
+ 
+    return {
+        "success": True,
+        "tenant": tenant_result.data[0],
+        "session": {
+            "access_token": auth_result.session.access_token if auth_result.session else None,
+            "refresh_token": auth_result.session.refresh_token if auth_result.session else None,
+        },
+    }
+ 
+ 
+@app.post("/auth/tenant/login")
+def tenant_login(payload: LoginRequest):
+    """A tenant logs in with phone + password. Mirrors landlord login exactly."""
+    require_supabase()
+ 
+    try:
+        normalized_phone = normalize_phone(payload.phone)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+ 
+    pseudo_email = phone_to_pseudo_email(normalized_phone)
+ 
+    try:
+        auth_result = supabase.auth.sign_in_with_password({
+            "email": pseudo_email,
+            "password": payload.password,
+        })
+    except Exception:
+        raise HTTPException(status_code=401, detail="Incorrect phone number or password.")
+ 
+    tenant_result = (
+        supabase.table("tenants").select("*").eq("auth_user_id", auth_result.user.id).single().execute()
+    )
+ 
+    return {
+        "success": True,
+        "tenant": tenant_result.data,
+        "session": {
+            "access_token": auth_result.session.access_token,
+            "refresh_token": auth_result.session.refresh_token,
+        },
+    }
+ 
+ 
+def get_current_landlord(authorization: Optional[str] = Header(None)) -> dict:
+    """
+    FastAPI dependency — verifies a Bearer token and returns the
+    calling landlord's profile. Use this on any endpoint that
+    should only be callable by a logged-in landlord, instead of
+    trusting a landlord_id passed in the request body (which
+    anyone could fake). Usage:
+ 
+        @app.post("/listings/my-listings")
+        def my_listings(landlord: dict = Depends(get_current_landlord)):
+            ...
+    """
+    require_supabase()
+ 
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+ 
+    token = authorization.replace("Bearer ", "")
+ 
+    try:
+        user_result = supabase.auth.get_user(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired session.")
+ 
+    if not user_result or not user_result.user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session.")
+ 
+    landlord_result = (
+        supabase.table("landlords").select("*").eq("auth_user_id", user_result.user.id).single().execute()
+    )
+    if not landlord_result.data:
+        raise HTTPException(status_code=404, detail="No landlord profile found for this account.")
+ 
+    return landlord_result.data
+ 
+ 
+@app.get("/auth/me")
+def get_my_profile(landlord: dict = Depends(get_current_landlord)):
+    """
+    Returns the logged-in landlord's own profile. Demonstrates
+    the get_current_landlord() dependency in action — the caller
+    never passes their own ID, it's derived entirely from their
+    auth token, so there's no way to query someone else's profile
+    by guessing an ID.
+    """
+    return {"landlord": landlord}
+ 
