@@ -21,6 +21,8 @@ from builders.email import send_match_email
 from builders.fraud import calculate_fraud_score, FRAUD_THRESHOLD_REVIEW, FRAUD_THRESHOLD_HIDE
 from app.auth import validate_signup_input, normalize_phone, phone_to_pseudo_email, is_valid_uganda_phone
 
+from pydantic import BaseModel
+from typing import Optional
 
 app = FastAPI(title="Nyumba Backend Service")
 
@@ -49,6 +51,42 @@ if SUPABASE_URL and SUPABASE_SERVICE_KEY:
 def require_supabase():
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase not configured.")
+
+
+def get_current_landlord(authorization: Optional[str] = Header(None)) -> dict:
+    """
+    FastAPI dependency — verifies a Bearer token and returns the
+    calling landlord's profile. Use this on any endpoint that
+    should only be callable by a logged-in landlord, instead of
+    trusting a landlord_id passed in the request body (which
+    anyone could fake). Usage:
+
+        @app.post("/listings/my-listings")
+        def my_listings(landlord: dict = Depends(get_current_landlord)):
+            ...
+    """
+    require_supabase()
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+
+    token = authorization.replace("Bearer ", "")
+
+    try:
+        user_result = supabase.auth.get_user(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired session.")
+
+    if not user_result or not user_result.user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session.")
+
+    landlord_result = (
+        supabase.table("landlords").select("*").eq("auth_user_id", user_result.user.id).single().execute()
+    )
+    if not landlord_result.data:
+        raise HTTPException(status_code=404, detail="No landlord profile found for this account.")
+
+    return landlord_result.data
 
 
 def run_matching_for_listing(listing_id: str) -> dict:
@@ -257,13 +295,10 @@ def get_default_weights():
     admin dashboard that lets you preview different weight settings."""
     return {"weights": DEFAULT_WEIGHTS}
 
-
-# ============================================
 # VERIFICATION WORKFLOW ENDPOINTS
-# ============================================
+
 
 class SubmitListingRequest(BaseModel):
-    landlord_id: str
     title: str
     area: str
     price_ugx: int
@@ -272,19 +307,29 @@ class SubmitListingRequest(BaseModel):
     amenities: list[str] = []
     latitude: float
     longitude: float
+    # landlord_id is intentionally NOT here anymore — it's derived
+    # from the caller's auth token via get_current_landlord(),
+    # so a landlord can only ever submit listings as themselves.
 
 
 @app.post("/listings/submit")
-def submit_listing(payload: SubmitListingRequest):
+def submit_listing(
+    payload: SubmitListingRequest,
+    landlord: dict = Depends(get_current_landlord),
+):
     """
     Called when a landlord finishes the listing wizard. Creates
     the listing as 'pending', then immediately tries to auto-assign
     the nearest available field agent via the SQL function.
+
+    landlord_id is derived from the caller's Bearer token —
+    never from the request body. A landlord cannot submit a
+    listing pretending to be someone else.
     """
     require_supabase()
 
     insert_data = {
-        "landlord_id": payload.landlord_id,
+        "landlord_id": landlord["id"],  # from verified auth token, not body
         "title": payload.title,
         "area": payload.area,
         "price_ugx": payload.price_ugx,
@@ -301,7 +346,6 @@ def submit_listing(payload: SubmitListingRequest):
         raise HTTPException(status_code=500, detail="Failed to create listing.")
     listing = result.data[0]
 
-    # ── Immediately attempt proximity-based agent assignment ──
     agent_result = supabase.rpc(
         "assign_listing_to_agent", {"p_listing_id": listing["id"]}
     ).execute()
@@ -321,25 +365,37 @@ def submit_listing(payload: SubmitListingRequest):
 
 class VerifyDecisionRequest(BaseModel):
     listing_id: str
-    agent_id: Optional[str] = None
     new_status: str
     notes: Optional[str] = None
     rejection_reason: Optional[str] = None
+    # agent_id is no longer accepted from the request body —
+    # it's read from the listing's assigned_agent_id and
+    # cross-checked against the agent_token header instead.
 
 
 @app.post("/listings/verify")
-def verify_listing(payload: VerifyDecisionRequest):
+def verify_listing(
+    payload: VerifyDecisionRequest,
+    agent_token: Optional[str] = Header(None),
+):
     """
     Called from the field agent's mobile view when they finish
     inspecting a property. Enforces the state machine rules from
-    app/verification.py — illegal transitions are rejected here,
-    before they ever reach the database.
+    app/verification.py — illegal transitions are rejected before
+    they reach the database.
+
+    Agent identity check: the caller must provide an
+    X-Agent-Token header matching the token stored on the
+    field_agents row. This is a lightweight check that prevents
+    any random caller from verifying listings — without requiring
+    a full Supabase Auth account for agents yet. Agents are
+    issued their token by an admin when their account is created.
     """
     require_supabase()
 
     listing_result = (
         supabase.table("listings")
-        .select("id, verification_status, assigned_agent_id, resubmission_count")
+        .select("id, verification_status, assigned_agent_id, resubmission_count, landlord_id")
         .eq("id", payload.listing_id)
         .single()
         .execute()
@@ -348,7 +404,38 @@ def verify_listing(payload: VerifyDecisionRequest):
         raise HTTPException(status_code=404, detail="Listing not found.")
     listing = listing_result.data
 
-    # ── Enforce the state machine — this is the whole point ──
+    # ── Verify the calling agent is the one assigned to this listing ──
+    assigned_agent_id = listing.get("assigned_agent_id")
+    if not assigned_agent_id:
+        raise HTTPException(
+            status_code=403,
+            detail="This listing has not been assigned to an agent yet."
+        )
+
+    if not agent_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing X-Agent-Token header."
+        )
+
+    agent_result = (
+        supabase.table("field_agents")
+        .select("id, current_workload, total_verified, agent_token")
+        .eq("id", assigned_agent_id)
+        .single()
+        .execute()
+    )
+    if not agent_result.data:
+        raise HTTPException(status_code=404, detail="Assigned agent not found.")
+
+    agent = agent_result.data
+    if agent.get("agent_token") != agent_token:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid agent token — you are not the assigned agent for this listing."
+        )
+
+    # ── Enforce the state machine ──
     if not can_transition(listing["verification_status"], payload.new_status):
         raise HTTPException(
             status_code=400,
@@ -359,35 +446,26 @@ def verify_listing(payload: VerifyDecisionRequest):
     if payload.new_status == "rejected" and payload.rejection_reason:
         updates["rejection_reason"] = payload.rejection_reason
     if payload.new_status == "verified":
-        updates["status"] = "live"  # now searchable — this is the flag ranking.py reads
+        updates["status"] = "live"
 
     supabase.table("listings").update(updates).eq("id", payload.listing_id).execute()
 
-    # ── Free up the agent's workload slot if this listing is now resolved ──
+    # ── Free up the agent's workload slot if resolved ──
     resolved_statuses = ["verified", "rejected"]
-    if payload.new_status in resolved_statuses and listing.get("assigned_agent_id"):
-        agent_result = (
-            supabase.table("field_agents")
-            .select("current_workload, total_verified")
-            .eq("id", listing["assigned_agent_id"])
-            .single()
-            .execute()
-        )
-        if agent_result.data:
-            agent = agent_result.data
-            supabase.table("field_agents").update({
-                "current_workload": max(0, agent["current_workload"] - 1),
-                "total_verified": (
-                    agent["total_verified"] + 1
-                    if payload.new_status == "verified"
-                    else agent["total_verified"]
-                ),
-            }).eq("id", listing["assigned_agent_id"]).execute()
+    if payload.new_status in resolved_statuses:
+        supabase.table("field_agents").update({
+            "current_workload": max(0, agent["current_workload"] - 1),
+            "total_verified": (
+                agent["total_verified"] + 1
+                if payload.new_status == "verified"
+                else agent["total_verified"]
+            ),
+        }).eq("id", assigned_agent_id).execute()
 
-    # ── Log the transition for the audit trail ──
+    # ── Log the transition ──
     supabase.table("verification_log").insert({
         "listing_id": payload.listing_id,
-        "agent_id": payload.agent_id or listing.get("assigned_agent_id"),
+        "agent_id": assigned_agent_id,
         "from_status": listing["verification_status"],
         "to_status": payload.new_status,
         "notes": payload.notes,
@@ -408,18 +486,25 @@ class ResubmitRequest(BaseModel):
 
 
 @app.post("/listings/resubmit")
-def resubmit_listing(payload: ResubmitRequest):
+def resubmit_listing(
+    payload: ResubmitRequest,
+    landlord: dict = Depends(get_current_landlord),
+):
     """
     A landlord whose listing was rejected can fix the issue and
     resubmit. Enforces the MAX_RESUBMISSIONS cap — after 3 attempts,
     this refuses and tells them to contact support instead of
     looping indefinitely.
+
+    Ownership check: the calling landlord must own this specific
+    listing. A landlord cannot resubmit someone else's rejected
+    listing, even if they know its ID.
     """
     require_supabase()
 
     listing_result = (
         supabase.table("listings")
-        .select("id, verification_status, resubmission_count")
+        .select("id, verification_status, resubmission_count, landlord_id")
         .eq("id", payload.listing_id)
         .single()
         .execute()
@@ -427,6 +512,13 @@ def resubmit_listing(payload: ResubmitRequest):
     if not listing_result.data:
         raise HTTPException(status_code=404, detail="Listing not found.")
     listing = listing_result.data
+
+    # ── Ownership check ──
+    if listing["landlord_id"] != landlord["id"]:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only resubmit your own listings."
+        )
 
     if not can_resubmit(listing):
         raise HTTPException(
@@ -509,9 +601,9 @@ def check_escalations(authorization: Optional[str] = Header(None)):
     return {"escalated": len(overdue), "listings": overdue}
 
 
-# ============================================
+
 # MATCHING / NOTIFICATIONS ENDPOINTS
-# ============================================
+
 
 class SavedSearchRequest(BaseModel):
     tenant_phone: str
@@ -572,9 +664,8 @@ def trigger_matching_manually(payload: TriggerMatchingRequest):
     return result
 
 
-# ============================================
 # FRAUD / TRUST SCORING ENDPOINTS
-# ============================================
+
 
 class ReportListingRequest(BaseModel):
     listing_id: str
@@ -770,22 +861,21 @@ def get_fraud_queue(min_score: float = Query(FRAUD_THRESHOLD_REVIEW)):
     return {"results": result.data or [], "count": len(result.data or [])}
 
 
-# ============================================
+
 # AUTH / PROFILES ENDPOINTS
-# ============================================
 # Phone+password login, implemented on top of Supabase Auth's
 # email/password system via a deterministic phone -> pseudo-email
 # mapping (see app/auth.py). The pseudo-email is an internal
 # implementation detail — landlords and tenants only ever see
 # and use their phone number.
- 
+
 class LandlordSignupRequest(BaseModel):
     phone: str
     password: str
     name: str
     email: Optional[str] = None  # real email, optional — different from the pseudo-email
- 
- 
+
+
 @app.post("/auth/landlord/signup")
 def landlord_signup(payload: LandlordSignupRequest):
     """
@@ -794,14 +884,14 @@ def landlord_signup(payload: LandlordSignupRequest):
     the landlords table, linked via auth_user_id.
     """
     require_supabase()
- 
+
     validation = validate_signup_input(payload.phone, payload.password, payload.name)
     if not validation["valid"]:
         raise HTTPException(status_code=400, detail=validation["error"])
- 
+
     normalized_phone = validation["normalized_phone"]
     pseudo_email = phone_to_pseudo_email(normalized_phone)
- 
+
     # Check for an existing landlord with this phone first — a clear
     # 409 is a much better experience than a confusing Supabase
     # Auth error surfacing from deep inside the sign-up call.
@@ -810,7 +900,7 @@ def landlord_signup(payload: LandlordSignupRequest):
     )
     if existing.data:
         raise HTTPException(status_code=409, detail="An account with this phone number already exists.")
- 
+
     try:
         auth_result = supabase.auth.sign_up({
             "email": pseudo_email,
@@ -818,10 +908,10 @@ def landlord_signup(payload: LandlordSignupRequest):
         })
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not create account: {e}")
- 
+
     if not auth_result.user:
         raise HTTPException(status_code=500, detail="Account creation failed.")
- 
+
     landlord_result = supabase.table("landlords").insert({
         "auth_user_id": auth_result.user.id,
         "phone": normalized_phone,
@@ -829,10 +919,10 @@ def landlord_signup(payload: LandlordSignupRequest):
         "email": payload.email,
         "created_via": "self_signup",
     }).execute()
- 
+
     if not landlord_result.data:
         raise HTTPException(status_code=500, detail="Account created but profile setup failed. Contact support.")
- 
+
     return {
         "success": True,
         "landlord": landlord_result.data[0],
@@ -841,13 +931,13 @@ def landlord_signup(payload: LandlordSignupRequest):
             "refresh_token": auth_result.session.refresh_token if auth_result.session else None,
         },
     }
- 
- 
+
+
 class LoginRequest(BaseModel):
     phone: str
     password: str
- 
- 
+
+
 @app.post("/auth/landlord/login")
 def landlord_login(payload: LoginRequest):
     """
@@ -856,14 +946,14 @@ def landlord_login(payload: LoginRequest):
     authenticates against Supabase Auth.
     """
     require_supabase()
- 
+
     try:
         normalized_phone = normalize_phone(payload.phone)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
- 
+
     pseudo_email = phone_to_pseudo_email(normalized_phone)
- 
+
     try:
         auth_result = supabase.auth.sign_in_with_password({
             "email": pseudo_email,
@@ -875,11 +965,11 @@ def landlord_login(payload: LoginRequest):
         # all. That distinction is exactly what lets an attacker
         # enumerate which phone numbers have accounts.
         raise HTTPException(status_code=401, detail="Incorrect phone number or password.")
- 
+
     landlord_result = (
         supabase.table("landlords").select("*").eq("auth_user_id", auth_result.user.id).single().execute()
     )
- 
+
     return {
         "success": True,
         "landlord": landlord_result.data,
@@ -888,15 +978,15 @@ def landlord_login(payload: LoginRequest):
             "refresh_token": auth_result.session.refresh_token,
         },
     }
- 
- 
+
+
 class TenantSignupRequest(BaseModel):
     phone: str
     password: str
     name: str
     email: Optional[str] = None
- 
- 
+
+
 @app.post("/auth/tenant/signup")
 def tenant_signup(payload: TenantSignupRequest):
     """
@@ -907,18 +997,18 @@ def tenant_signup(payload: TenantSignupRequest):
     ONE identity going forward.
     """
     require_supabase()
- 
+
     validation = validate_signup_input(payload.phone, payload.password, payload.name)
     if not validation["valid"]:
         raise HTTPException(status_code=400, detail=validation["error"])
- 
+
     normalized_phone = validation["normalized_phone"]
     pseudo_email = phone_to_pseudo_email(normalized_phone)
- 
+
     existing = supabase.table("tenants").select("id").eq("phone", normalized_phone).execute()
     if existing.data:
         raise HTTPException(status_code=409, detail="An account with this phone number already exists.")
- 
+
     try:
         auth_result = supabase.auth.sign_up({
             "email": pseudo_email,
@@ -926,20 +1016,20 @@ def tenant_signup(payload: TenantSignupRequest):
         })
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not create account: {e}")
- 
+
     if not auth_result.user:
         raise HTTPException(status_code=500, detail="Account creation failed.")
- 
+
     tenant_result = supabase.table("tenants").insert({
         "auth_user_id": auth_result.user.id,
         "phone": normalized_phone,
         "name": payload.name,
         "email": payload.email,
     }).execute()
- 
+
     if not tenant_result.data:
         raise HTTPException(status_code=500, detail="Account created but profile setup failed. Contact support.")
- 
+
     return {
         "success": True,
         "tenant": tenant_result.data[0],
@@ -948,20 +1038,20 @@ def tenant_signup(payload: TenantSignupRequest):
             "refresh_token": auth_result.session.refresh_token if auth_result.session else None,
         },
     }
- 
- 
+
+
 @app.post("/auth/tenant/login")
 def tenant_login(payload: LoginRequest):
     """A tenant logs in with phone + password. Mirrors landlord login exactly."""
     require_supabase()
- 
+
     try:
         normalized_phone = normalize_phone(payload.phone)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
- 
+
     pseudo_email = phone_to_pseudo_email(normalized_phone)
- 
+
     try:
         auth_result = supabase.auth.sign_in_with_password({
             "email": pseudo_email,
@@ -969,11 +1059,11 @@ def tenant_login(payload: LoginRequest):
         })
     except Exception:
         raise HTTPException(status_code=401, detail="Incorrect phone number or password.")
- 
+
     tenant_result = (
         supabase.table("tenants").select("*").eq("auth_user_id", auth_result.user.id).single().execute()
     )
- 
+
     return {
         "success": True,
         "tenant": tenant_result.data,
@@ -982,44 +1072,8 @@ def tenant_login(payload: LoginRequest):
             "refresh_token": auth_result.session.refresh_token,
         },
     }
- 
- 
-def get_current_landlord(authorization: Optional[str] = Header(None)) -> dict:
-    """
-    FastAPI dependency — verifies a Bearer token and returns the
-    calling landlord's profile. Use this on any endpoint that
-    should only be callable by a logged-in landlord, instead of
-    trusting a landlord_id passed in the request body (which
-    anyone could fake). Usage:
- 
-        @app.post("/listings/my-listings")
-        def my_listings(landlord: dict = Depends(get_current_landlord)):
-            ...
-    """
-    require_supabase()
- 
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
- 
-    token = authorization.replace("Bearer ", "")
- 
-    try:
-        user_result = supabase.auth.get_user(token)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired session.")
- 
-    if not user_result or not user_result.user:
-        raise HTTPException(status_code=401, detail="Invalid or expired session.")
- 
-    landlord_result = (
-        supabase.table("landlords").select("*").eq("auth_user_id", user_result.user.id).single().execute()
-    )
-    if not landlord_result.data:
-        raise HTTPException(status_code=404, detail="No landlord profile found for this account.")
- 
-    return landlord_result.data
- 
- 
+
+
 @app.get("/auth/me")
 def get_my_profile(landlord: dict = Depends(get_current_landlord)):
     """
@@ -1030,4 +1084,81 @@ def get_my_profile(landlord: dict = Depends(get_current_landlord)):
     by guessing an ID.
     """
     return {"landlord": landlord}
- 
+
+
+# GET /landlord/listings — every listing this landlord owns, newest first
+
+@app.get("/landlord/listings")
+def get_landlord_listings(landlord: dict = Depends(get_current_landlord)):
+    sb = require_supabase()
+
+    rows = (
+        sb.table("listings")
+        .select(
+            "id,title,area,price_ugx,bedrooms,amenities,photo_urls,description,"
+            "verification_status,is_verified,submitted_at,verification_deadline"
+        )
+        .eq("landlord_id", landlord["id"])
+        .order("submitted_at", desc=True)
+        .execute()
+    )
+
+    # Pull in any open fraud flag per listing so the dashboard can warn
+    # the landlord without them needing to find out from a tenant complaint.
+    listing_ids = [r["id"] for r in (rows.data or [])]
+    fraud_by_listing = {}
+    if listing_ids:
+        fraud_rows = (
+            sb.table("fraud_risk_summary")
+            .select("listing_id,fraud_score")
+            .in_("listing_id", listing_ids)
+            .execute()
+        )
+        fraud_by_listing = {r["listing_id"]: r["fraud_score"] for r in (fraud_rows.data or [])}
+
+    listings = []
+    for r in rows.data or []:
+        r["fraud_score"] = fraud_by_listing.get(r["id"])
+        listings.append(r)
+
+    return {"listings": listings, "count": len(listings)}
+
+
+class EditListingInput(BaseModel):
+    title: Optional[str] = None
+    area: Optional[str] = None
+    bedrooms: Optional[int] = None
+    price_ugx: Optional[int] = None
+    description: Optional[str] = None
+    amenities: Optional[list[str]] = None
+    photo_urls: Optional[list[str]] = None
+
+
+
+# PATCH /listings/{listing_id} — edit only the fields provided, ownership-checked
+# -----------------------------------------------------------------------------
+@app.patch("/listings/{listing_id}")
+def edit_listing(
+    listing_id: str,
+    body: EditListingInput,
+    landlord: dict = Depends(get_current_landlord),
+):
+    sb = require_supabase()
+
+    existing = sb.table("listings").select("id,landlord_id").eq("id", listing_id).execute().data
+    if not existing:
+        raise HTTPException(404, "Listing not found")
+    if existing[0]["landlord_id"] != landlord["id"]:
+        raise HTTPException(403, "You don't own this listing")
+
+    updates = {k: v for k, v in body.dict().items() if v is not None}
+    if not updates:
+        raise HTTPException(400, "Nothing to update")
+
+    # last_updated_at feeds the freshness ranking signal directly — an edit
+    # should count as "the landlord touched this listing", same as it does
+    # for any other update path.
+    updates["last_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    result = sb.table("listings").update(updates).eq("id", listing_id).execute()
+    return {"listing": result.data[0]}
