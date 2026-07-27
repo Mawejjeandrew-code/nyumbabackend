@@ -1,7 +1,7 @@
 
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Header, Depends
@@ -1162,3 +1162,104 @@ def edit_listing(
 
     result = sb.table("listings").update(updates).eq("id", listing_id).execute()
     return {"listing": result.data[0]}
+
+
+# Inquiry inbox endpoints
+
+
+class InquiryInput(BaseModel):
+    tenant_name: str
+    tenant_phone: str
+    message: str
+
+
+@app.post("/listings/{listing_id}/inquire")
+def submit_inquiry(listing_id: str, body: InquiryInput):
+    sb = require_supabase()
+
+    listing = sb.table("listings").select("id,landlord_id,title").eq("id", listing_id).execute().data
+    if not listing:
+        raise HTTPException(404, "Listing not found")
+
+    result = sb.table("inquiries").insert({
+        "listing_id": listing_id,
+        "landlord_id": listing[0]["landlord_id"],
+        "tenant_name": body.tenant_name,
+        "tenant_phone": body.tenant_phone,
+        "message": body.message,
+    }).execute()
+
+    return {"success": True, "inquiry": result.data[0]}
+
+#Get /landlord/inquries - every inquiry across all of this listing, unreplied first.
+@app.get("/landlord/inquiries")
+def get_landlord_inquiries(landlord: dict = Depends(get_current_landlord)):
+    sb = require_supabase()
+ 
+    rows = (
+        sb.table("inquiries")
+        .select("id,listing_id,tenant_name,tenant_phone,message,reply_message,replied_at,created_at,listings(title,area)")
+        .eq("landlord_id", landlord["id"])
+        .order("replied_at", desc=False, nullsfirst=True)
+        .order("created_at", desc=True)
+        .execute()
+    )
+ 
+    unreplied = sum(1 for r in (rows.data or []) if not r.get("replied_at"))
+    return {"inquiries": rows.data or [], "count": len(rows.data or []), "unreplied": unreplied}
+ 
+ 
+class ReplyInput(BaseModel):
+    reply_message: str
+ 
+ 
+# -----------------------------------------------------------------------------
+# POST /inquiries/{inquiry_id}/reply — landlord replies, ownership-checked.
+# Setting replied_at fires the DB trigger that recalculates
+# avg_response_minutes — this is the one write that actually feeds the
+# ranking algorithm's response-speed signal from real usage.
+# Also SMS's the tenant directly, since that's the only channel they gave.
+# -----------------------------------------------------------------------------
+@app.post("/inquiries/{inquiry_id}/reply")
+def reply_to_inquiry(
+    inquiry_id: str,
+    body: ReplyInput,
+    landlord: dict = Depends(get_current_landlord),
+):
+    sb = require_supabase()
+ 
+    existing = (
+        sb.table("inquiries")
+        .select("id,landlord_id,tenant_phone,tenant_name,replied_at")
+        .eq("id", inquiry_id)
+        .execute()
+        .data
+    )
+    if not existing:
+        raise HTTPException(404, "Inquiry not found")
+    if existing[0]["landlord_id"] != landlord["id"]:
+        raise HTTPException(403, "This isn't your inquiry to reply to")
+ 
+    result = (
+        sb.table("inquiries")
+        .update({
+            "reply_message": body.reply_message,
+            "replied_at": datetime.now(timezone.utc).isoformat(),
+        })
+        .eq("id", inquiry_id)
+        .execute()
+    )
+ 
+    sms_sent = False
+    try:
+        send_sms(
+            existing[0]["tenant_phone"],
+            f"Nyumba: {landlord.get('name', 'The landlord')} replied — \"{body.reply_message}\"",
+        )
+        sms_sent = True
+    except Exception:
+        # Reply is already saved even if the SMS provider hiccups —
+        # don't fail the whole request over a delivery-channel error.
+        pass
+ 
+    return {"success": True, "inquiry": result.data[0], "sms_sent": sms_sent}
