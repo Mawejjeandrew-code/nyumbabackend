@@ -23,6 +23,9 @@ from app.auth import validate_signup_input, normalize_phone, phone_to_pseudo_ema
 
 from pydantic import BaseModel
 from typing import Optional
+import secrets
+
+
 
 app = FastAPI(title="Nyumba Backend Service")
 
@@ -154,6 +157,48 @@ def run_matching_for_listing(listing_id: str) -> dict:
 
     return {"matched": len(matches), "notifications_sent": sent_count}
 
+class SavedSearchInput(BaseModel):
+    tenant_name: str
+    tenant_phone: str
+    tenant_email: Optional[str] = None
+    area: Optional[str] = None
+    min_price: Optional[int] = None
+    max_price: Optional[int] = None
+    bedrooms: Optional[int] = None
+    amenities: Optional[list[str]] = None
+
+@app.post("/saved-sesrches") 
+def create_saved_search(body: SavedSearchInput):
+    sb = require_supabase()
+
+    token = secrets.token_urlsafe(16)  
+    result = sb.table("saved_searches").insert({
+        "tenant_name": body.tenant_name,
+        "tenant_phone": body.tenant_phone,
+        "tenant_email": body.tenant_email,
+        "area": body.area,
+        "min_price": body.min_price,
+        "max_price": body.max_price,
+        "bedrooms": body.bedrooms,
+        "amenities": body.amenities or [],
+        "unsubscribe_token": token,
+        "is_active": True,
+    
+    }).execute()
+
+    return {"success": True, "saved_search": result.data[0]}
+
+
+@app.get("/saved-searches/unsubscribe/{token}")
+def unsubscribe_saved_search(token: str):
+    sb = require_supabase()
+
+    existing = sb.table("saved_searches").select("id").eq("unsubscribe_token", token).execute().data
+    if not existing:
+        raise HTTPException(404, "This link is invalid or already unsubscribed")
+
+    sb.table("saved_srearches").update({"is_active": False}).eq("unsubscribe_token", token).execute()
+    return {"success": True}
 
 @app.get("/health")
 def health():
