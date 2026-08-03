@@ -1264,7 +1264,7 @@ class ReplyInput(BaseModel):
 # avg_response_minutes — this is the one write that actually feeds the
 # ranking algorithm's response-speed signal from real usage.
 # Also SMS's the tenant directly, since that's the only channel they gave.
-# -----------------------------------------------------------------------------
+
 @app.post("/inquiries/{inquiry_id}/reply")
 def reply_to_inquiry(
     inquiry_id: str,
@@ -1297,7 +1297,7 @@ def reply_to_inquiry(
  
     sms_sent = False
     try:
-        send_sms(
+        send_match_sms(
             existing[0]["tenant_phone"],
             f"Nyumba: {landlord.get('name', 'The landlord')} replied — \"{body.reply_message}\"",
         )
@@ -1308,3 +1308,4 @@ def reply_to_inquiry(
         pass
  
     return {"success": True, "inquiry": result.data[0], "sms_sent": sms_sent}
+
